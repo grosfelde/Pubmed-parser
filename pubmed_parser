@@ -1,0 +1,111 @@
+import re
+
+import pandas as pd
+import datetime
+
+from bs4 import BeautifulSoup
+
+import asyncio
+import aiohttp
+
+
+'''
+https://pubmed.ncbi.nlm.nih.gov/?term=yeast%20cell%20death&size=200&page=2
+'''
+
+import nest_asyncio
+nest_asyncio.apply()
+
+
+async def get_results_amount(session, term):
+    params = {
+        'term': term,
+        'size': 10,
+        'page': 1
+    }
+    async with session.get("https://pubmed.ncbi.nlm.nih.gov/", params=params) as response:
+        html_doc = await response.text()
+        soup = BeautifulSoup(html_doc, 'html.parser')
+        results_amount_div = soup.find('div', class_='results-amount')
+        if results_amount_div.text.count('No results'):
+            return 0
+        result = results_amount_div.find('span').text.replace('\n', '').replace(',', '')
+        return int(result)
+
+
+reg_year = re.compile(r'(20\d\d)|(19\d\d)|(18\d\d)')
+
+
+async def fetch_page(session, term, size, page):
+    params = {
+        'term': term,
+        'size': size,
+        'page': page
+    }
+    async with session.get("https://pubmed.ncbi.nlm.nih.gov/", params=params) as response:
+        html_doc = await response.text()
+        soup = BeautifulSoup(html_doc, 'html.parser')
+        result = []
+        for article in soup.find_all('article'):
+            head = article.find('a', {'class': 'labs-docsum-title'})
+            doi_block = article.find('span', {'class': 'labs-docsum-journal-citation'})
+
+            doi_value = ""
+            try:
+                doi = doi_block.text.replace('\n', '')
+                doi_value = doi.split('doi: ')[-1].split(' ')[0] if doi.count('doi') > 0 else ""
+            except Exception:
+                pass
+
+            year = ""
+            try:
+                year_block = doi_block.text.replace('\n', '')
+                year_reg = reg_year.search(year_block.split('doi: ')[0])
+                if year_reg is not None:
+                    year = year_reg.group(0)
+            except Exception:
+                pass
+
+            result.append({'name': head.text.replace('\n', '').strip(),
+                           'pmid': head['data-ga-label'],
+                           'doi': doi_value,
+                           'year': year,
+                           'url': 'https://pubmed.ncbi.nlm.nih.gov/{}/'.format(head['data-ga-label'])
+                           })
+
+        return result
+
+
+async def process_request(term):
+    async with aiohttp.ClientSession() as session:
+        results_count = await get_results_amount(session, term)
+        print(f'Found {results_count} results')
+        num_pages = results_count // 200 + 2
+        requests = [
+            fetch_page(session, term, 200, page) for page in range(num_pages)
+        ]
+        responses = await asyncio.gather(*requests)
+
+        parser_result = []
+        for response in responses:
+            parser_result.extend(response)
+
+        return parser_result
+
+
+def write_to_excel(term, parser_result):
+    df = pd.DataFrame(columns=['name', 'pmid', 'doi', 'year', 'url'])
+    for i in range(len(parser_result)):
+        cur = parser_result[i]
+        df.loc[i] = [cur['name'], cur['pmid'], cur['doi'], cur['year'], cur['url']]
+
+    filename = term  + '.xls'
+    df.to_excel(filename)
+    print(f'{len(parser_result)} results saved to {filename}. ')
+
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    term = input('Enter search request: ')
+    parser_result = loop.run_until_complete(process_request(term)) 
+    write_to_excel(term, parser_result)
